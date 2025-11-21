@@ -4,9 +4,10 @@ This file provides guidance to Codex when working with code in this repository.
 
 ## プロジェクト概要
 
-DuckDBを使用した高速ベクトル検索システム（プロジェクト名: duckdb-hybrid-search）。日本語ドキュメント検索に最適化されており、以下の技術を使用:
+DuckDBを使用したハイブリッド検索システム（プロジェクト名: duckdb-hybrid-search）。日本語ドキュメント検索に最適化されており、以下の技術を使用:
 - PLaMo埋め込みモデル (pfnet/plamo-embedding-1b) による高品質な日本語セマンティック検索
-- DuckDBのVSS拡張とHNSWインデックスによる高速な類似度検索
+- DuckDBのVSS拡張とHNSWインデックスによる高速なベクトル類似度検索
+- DuckDBのFTS拡張とBM25による全文検索
 - PyTorchによるモデル推論とGPUアクセラレーション
 
 ## アーキテクチャ
@@ -20,11 +21,21 @@ DuckDBを使用した高速ベクトル検索システム（プロジェクト�
 - CUDA利用可能時は自動検出
 
 **データベース初期化** (`src/create_vss.py`)
-- `docs/md_rag/`からYAMLフロントマター付きMarkdownファイルを解析
+- `docs/md_rag_fts/`からYAMLフロントマター付きMarkdownファイルを解析
 - `---`セパレータでドキュメントをチャンク分割
+- `[FTS]...[/FTS]`タグからFTS用キーワードを抽出
 - 各チャンクに対して2048次元の埋め込みベクトルを生成
-- 2つのモード: MODE=1 (テーブル再作成), MODE=2 (既存テーブルに追加)
+- テーブルが存在しなければ新規作成、存在すれば追加モード
+- FTSインデックスは自動作成される
 - **重要**: HNSWインデックスは自動作成されない - 別途作成が必要
+
+**ハイブリッド検索データベース初期化** (`src/create_hybrid.py`)
+- `create_vss.py`の拡張版
+- ハイブリッド検索（VSS+FTS）用のデータベース作成
+
+**ハイブリッド検索インターフェース** (`src/search_hybrid.py`)
+- `search_vss.py`の拡張版
+- VSS検索とFTS検索を組み合わせたハイブリッド検索機能
 
 **インデックス管理** (`src/index_manager.py`)
 - ベクトル検索用のHNSWインデックスを管理
@@ -33,11 +44,12 @@ DuckDBを使用した高速ベクトル検索システム（プロジェクト�
 - Web API起動時は`ensure_index()`でインデックスの存在を保証
 
 **検索インターフェース** (`src/search_vss.py`)
-- `get_connection()`による読み取り専用接続プーリング
-- コサイン距離メトリックでHNSWインデックスを使用
-- 類似度スコア付きでランク付けされた結果を返す
-- デフォルトデータベース: `docs/db/facility_assist.duckdb`
-- `search()`関数を他のモジュールから利用可能
+- `get_connection()`による読み取り専用接続プーリング（VSS/FTS両拡張をロード）
+- `vss_search()`: コサイン距離メトリックでHNSWインデックスを使用したベクトル検索
+- `fts_search()`: BM25スコアリングによる全文検索
+- `search_vss_display()`: VSS検索結果を表示
+- `search_fts_display()`: FTS検索結果を表示
+- デフォルトデータベース: `docs/db/duckdb_search.duckdb`
 
 **対話型検索** (`src/search_interactive.py`)
 - 起動時にモデルを1回だけロード（サービス起動に相当）
@@ -62,7 +74,7 @@ uv sync
 uv run src/create_vss.py
 
 # HNSWインデックスの作成（データベース作成後に必須）
-uv run src/index_manager.py --db docs/db/facility_assist.duckdb ensure
+uv run src/index_manager.py --db docs/db/duckdb_search.duckdb ensure
 
 # インデックス管理
 uv run src/index_manager.py --db <パス> create [--force]
@@ -90,10 +102,13 @@ uv run src/search_vss.py
 - `category` - YAMLフロントマターから取得
 - `tag` - YAMLフロントマターから取得
 - `content` - チャンク分割されたテキストコンテンツ
+- `content_fts` - FTS用キーワード（`[FTS]...[/FTS]`タグから抽出）
 - `content_v` - FLOAT[2048]型の埋め込みベクトル
 - `created_at` - タイムスタンプ
 
-インデックス: `documents_vss_idx` (content_v上のHNSW、コサインメトリック)
+インデックス:
+- `documents_vss_idx` - content_v上のHNSW（コサインメトリック）
+- `fts_main_documents` - content上のFTSインデックス（BM25検索用）
 
 ## 重要な実装詳細
 
@@ -101,7 +116,7 @@ uv run src/search_vss.py
 全モジュールは`get_model_and_tokenizer()`による遅延初期化を使用。モデルはグローバルにキャッシュされ、重複ロードを防ぐ。
 
 ### ドキュメントのチャンク分割
-`docs/md_rag/`内のMarkdownファイルは以下の形式を使用:
+`docs/md_rag_fts/`内のMarkdownファイルは以下の形式を使用:
 ```
 ---
 document_name: "名前"
@@ -110,13 +125,17 @@ category: "カテゴリ"
 tag: "タグ"
 ---
 最初のチャンクの内容
+
+[FTS]キーワード1 キーワード2 キーワード3[/FTS]
 ---
 2番目のチャンクの内容
+
+[FTS]キーワード4 キーワード5[/FTS]
 ---
 ```
 
 ### インデックス管理ワークフロー
-1. `create_vss.py`を実行してデータベースを作成（インデックスは作成されない）
+1. `create_vss.py`を実行してデータベースを作成（FTSインデックスは自動作成）
 2. `index_manager.py ensure`を実行してHNSWインデックスを作成
 3. Web API用途では、起動時に`IndexManager.ensure_index()`を呼び出す
 

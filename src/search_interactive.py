@@ -1,9 +1,10 @@
 """
-対話型ベクトル検索デモ
+対話型ハイブリッド検索デモ
 
 モデルロードは起動時の1回のみ。
-以降の検索は高速に実行できることを実感できます。
+VSS（ベクトル検索）とFTS（全文検索）を選択して検索できます。
 """
+
 import duckdb
 import torch
 import time
@@ -11,10 +12,10 @@ import time
 from embedding_model import get_model_and_tokenizer
 
 # 設定
-DB_NAME = "facility_assist"
+DB_NAME = "duckdb_search"
 
 print("=" * 80)
-print("📚 ベクトル検索システム - 対話モード")
+print("📚 ハイブリッド検索システム - 対話モード")
 print("=" * 80)
 
 # モデルの取得（起動時に一度だけ）
@@ -25,7 +26,7 @@ v_model, v_tokenizer = get_model_and_tokenizer()
 model_load_time = time.perf_counter() - start_time
 print(f"✅ モデル読み込み完了: {model_load_time:.3f}秒")
 print("\n" + "=" * 80)
-print("準備完了！検索クエリを入力してください")
+print("準備完了！検索モードを選択してクエリを入力してください")
 print("（'exit' または 'quit' で終了）")
 print("=" * 80 + "\n")
 
@@ -41,6 +42,8 @@ def get_connection():
         _conn = duckdb.connect(db_path, read_only=True)
         _conn.install_extension("vss")
         _conn.load_extension("vss")
+        _conn.install_extension("fts")
+        _conn.load_extension("fts")
     return _conn
 
 
@@ -85,21 +88,104 @@ def vss_search(query, limit=5):
         }
 
 
-def display_results(query, rows, timings):
-    """検索結果を表示"""
-    print(f"\n🔍 検索: '{query}'")
-    print(f"⏱️  処理時間: {timings['total_time']:.3f}秒 "
-          f"(埋め込み: {timings['embed_time']:.3f}秒, 検索: {timings['search_time']:.3f}秒)")
+def fts_search(keywords, limit=5):
+    """全文検索を実行（BM25スコアリング）"""
+    total_start = time.perf_counter()
+
+    conn = get_connection()
+
+    # BM25検索
+    search_start = time.perf_counter()
+    rows = conn.sql(
+        """
+        SELECT
+            id,
+            document_name,
+            document_path,
+            category,
+            tag,
+            content,
+            content_fts,
+            score
+        FROM (
+            SELECT *, fts_main_documents.match_bm25(id, ?) AS score
+            FROM documents
+        ) sq
+        WHERE score IS NOT NULL
+        ORDER BY score DESC
+        LIMIT ?
+        """,
+        params=[keywords, limit],
+    ).fetchall()
+    search_time = time.perf_counter() - search_start
+
+    total_time = time.perf_counter() - total_start
+
+    return rows, {
+        "search_time": search_time,
+        "total_time": total_time,
+    }
+
+
+def display_vss_results(query, rows, timings):
+    """VSS検索結果を表示"""
+    print(f"\n🔍 VSS検索: '{query}'")
+    print(
+        f"⏱️  処理時間: {timings['total_time']:.3f}秒 "
+        f"(埋め込み: {timings['embed_time']:.3f}秒, 検索: {timings['search_time']:.3f}秒)"
+    )
     print("-" * 80)
 
     if not rows:
         print("❌ 結果が見つかりませんでした")
         return
 
-    for idx, (id, distance, document_name, document_path, category, tag, content) in enumerate(rows, 1):
+    for idx, (
+        id,
+        distance,
+        document_name,
+        document_path,
+        category,
+        tag,
+        content,
+    ) in enumerate(rows, 1):
         similarity = 1 - distance  # cosine distance -> similarity
         print(f"\n[{idx}] ID: {id} | 類似度: {similarity:.4f}")
         print(f"    📄 {document_name} ({category})")
+
+        # 内容を適切な長さで表示
+        content_preview = content[:150].replace("\n", " ")
+        if len(content) > 150:
+            content_preview += "..."
+        print(f"    💬 {content_preview}")
+
+
+def display_fts_results(keywords, rows, timings):
+    """FTS検索結果を表示"""
+    print(f"\n🔍 FTS検索: '{keywords}'")
+    print(f"⏱️  処理時間: {timings['total_time']:.3f}秒 (検索: {timings['search_time']:.3f}秒)")
+    print("-" * 80)
+
+    if not rows:
+        print("❌ 結果が見つかりませんでした")
+        return
+
+    for idx, (
+        id,
+        document_name,
+        document_path,
+        category,
+        tag,
+        content,
+        content_fts,
+        score,
+    ) in enumerate(rows, 1):
+        print(f"\n[{idx}] ID: {id} | BM25スコア: {score:.4f}")
+        print(f"    📄 {document_name} ({category})")
+        if len(content_fts) > 80:
+            print(f"    🏷️  FTSキーワード: {content_fts[:80]}...")
+        else:
+            print(f"    🏷️  FTSキーワード: {content_fts}")
 
         # 内容を適切な長さで表示
         content_preview = content[:150].replace("\n", " ")
@@ -122,27 +208,50 @@ def main():
 
     try:
         while True:
-            # ユーザー入力を取得
+            # 検索モード選択
+            print("\n検索モードを選択してください:")
+            print("  1: VSS（ベクトル類似度検索）")
+            print("  2: FTS（全文検索/BM25）")
             try:
-                query = input("\n検索> ").strip()
+                mode = input("モード (1/2)> ").strip()
             except EOFError:
                 print("\n👋 終了します")
                 break
 
-            # 終了コマンドのチェック
+            if mode.lower() in ["exit", "quit", "q", "終了"]:
+                print("\n👋 終了します")
+                break
+
+            if mode not in ["1", "2"]:
+                print("⚠️  1 または 2 を入力してください")
+                continue
+
+            # クエリ入力
+            try:
+                if mode == "1":
+                    query = input("検索クエリ> ").strip()
+                else:
+                    query = input("検索キーワード（スペース区切り）> ").strip()
+            except EOFError:
+                print("\n👋 終了します")
+                break
+
             if query.lower() in ["exit", "quit", "q", "終了"]:
                 print("\n👋 終了します")
                 break
 
-            # 空入力のスキップ
             if not query:
                 continue
 
             # 検索実行
             search_count += 1
             try:
-                rows, timings = vss_search(query, limit=5)
-                display_results(query, rows, timings)
+                if mode == "1":
+                    rows, timings = vss_search(query, limit=5)
+                    display_vss_results(query, rows, timings)
+                else:
+                    rows, timings = fts_search(query, limit=5)
+                    display_fts_results(query, rows, timings)
             except Exception as e:
                 print(f"\n❌ エラーが発生しました: {e}")
                 continue
@@ -152,7 +261,7 @@ def main():
     finally:
         # 統計情報を表示
         print("\n" + "=" * 80)
-        print(f"📊 統計情報")
+        print("📊 統計情報")
         print(f"  総検索回数: {search_count}回")
         print(f"  モデルロード: 1回のみ ({model_load_time:.3f}秒)")
         print("=" * 80)

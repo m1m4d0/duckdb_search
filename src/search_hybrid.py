@@ -5,7 +5,7 @@ import time
 from embedding_model import get_model_and_tokenizer
 
 # 設定
-DB_NAME = "facility_assist"
+DB_NAME = "duckdb_search"
 
 # モデルの取得（起動時に一度だけ）
 print("=" * 80)
@@ -28,6 +28,8 @@ def get_connection():
         _conn = duckdb.connect(db_path, read_only=True)
         _conn.install_extension("vss")
         _conn.load_extension("vss")
+        _conn.install_extension("fts")
+        _conn.load_extension("fts")
     return _conn
 
 
@@ -75,14 +77,57 @@ def vss_search(query, limit=10):
         return rows
 
 
-def search(query, limit=10):
-    """検索を実行して結果を表示"""
-    print(f"Query: {query}")
-    print("-" * 80)
+def fts_search(query, limit=10):
+    """全文検索を実行（BM25スコアリング）"""
+    total_start = time.perf_counter()
 
+    # DB接続
+    conn_start = time.perf_counter()
+    conn = get_connection()
+    conn_time = time.perf_counter() - conn_start
+    print(f"  [DB接続] {conn_time:.3f}秒")
+
+    # BM25検索
+    search_start = time.perf_counter()
+    rows = conn.sql(
+        """
+        SELECT
+            id,
+            document_name,
+            document_path,
+            category,
+            tag,
+            content,
+            content_fts,
+            score
+        FROM (
+            SELECT *, fts_main_documents.match_bm25(id, ?) AS score
+            FROM documents
+        ) sq
+        WHERE score IS NOT NULL
+        ORDER BY score DESC
+        LIMIT ?
+        """,
+        params=[query, limit],
+    ).fetchall()
+    search_time = time.perf_counter() - search_start
+    print(f"  [FTS検索(BM25)] {search_time:.3f}秒")
+
+    total_time = time.perf_counter() - total_start
+    print(f"  [合計] {total_time:.3f}秒")
+
+    return rows
+
+
+def search_vss_display(query, limit=3):
+    """VSS検索を実行して結果を表示"""
+    print(f"Query: {query}")
+    print("=" * 80)
+    print("\n【ベクトル類似度検索（VSS）上位{0}件】".format(limit))
+    print("-" * 80)
     rows = vss_search(query, limit)
     for id, distance, document_name, document_path, category, tag, content in rows:
-        similarity = 1 - distance  # cosine distance -> similarity
+        similarity = 1 - distance
         print(f"ID: {id}, Similarity: {similarity:.4f}")
         print(f"  Document: {document_name}")
         print(f"  Category: {category}")
@@ -93,7 +138,39 @@ def search(query, limit=10):
             else f"  Content: {content}"
         )
         print()
+    return rows
 
+
+def search_fts_display(keywords, limit=3):
+    """FTS検索を実行して結果を表示"""
+    print(f"Keywords: {keywords}")
+    print("=" * 80)
+    print("\n【全文検索（FTS/BM25）上位{0}件】".format(limit))
+    print("-" * 80)
+    rows = fts_search(keywords, limit)
+    if not rows:
+        print("  (該当なし)")
+    for (
+        id,
+        document_name,
+        document_path,
+        category,
+        tag,
+        content,
+        content_fts,
+        score,
+    ) in rows:
+        print(f"ID: {id}, BM25 Score: {score:.4f}")
+        print(f"  Document: {document_name}")
+        print(f"  Category: {category}")
+        print(f"  Tag: {tag}")
+        print(f"  FTS Keywords: {content_fts}")
+        print(
+            f"  Content: {content[:100]}..."
+            if len(content) > 100
+            else f"  Content: {content}"
+        )
+        print()
     return rows
 
 
@@ -106,12 +183,16 @@ def close_connection():
 
 
 def main():
-    print("\n【1回目の検索】（初回）")
-    search("設備監視について教えてください")
+    query = "設備監視について教えてください"
+    # クエリからキーワードを抽出（実際はLLM等で抽出する想定）
+    keywords = "設備 監視"
+
+    print("\n【VSS検索】")
+    search_vss_display(query)
 
     print("\n" + "=" * 80)
-    print("【2回目の検索】（モデル読み込み済み）")
-    search("利用料金について")
+    print("\n【FTS検索】")
+    search_fts_display(keywords)
 
     # プログラム終了時
     close_connection()
