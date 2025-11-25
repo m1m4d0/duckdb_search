@@ -39,11 +39,23 @@ def get_connection():
     global _conn
     if _conn is None:
         db_path = f"docs/db/{DB_NAME}.duckdb"
-        _conn = duckdb.connect(db_path, read_only=True)
-        _conn.install_extension("vss")
-        _conn.load_extension("vss")
-        _conn.install_extension("fts")
-        _conn.load_extension("fts")
+        try:
+            # 拡張が既に入っている前提で読み取り専用接続
+            _conn = duckdb.connect(db_path, read_only=True)
+            _conn.load_extension("vss")
+            _conn.load_extension("fts")
+        except Exception:
+            # 初回だけ書き込み可能にして拡張をインストールし、再度read-onlyで開く
+            install_conn = duckdb.connect(db_path)
+            install_conn.install_extension("vss")
+            install_conn.load_extension("vss")
+            install_conn.install_extension("fts")
+            install_conn.load_extension("fts")
+            install_conn.close()
+
+            _conn = duckdb.connect(db_path, read_only=True)
+            _conn.load_extension("vss")
+            _conn.load_extension("fts")
     return _conn
 
 

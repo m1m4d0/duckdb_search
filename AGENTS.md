@@ -1,6 +1,8 @@
-# AGENTS.md
+# CLAUDE.md
 
-This file provides guidance to Codex when working with code in this repository.
+日本語で回答してください。
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## プロジェクト概要
 
@@ -20,41 +22,29 @@ DuckDBを使用したハイブリッド検索システム（プロジェクト�
 - 全モジュールで共有するため`get_model_and_tokenizer()`を提供
 - CUDA利用可能時は自動検出
 
-**データベース初期化** (`src/create_vss.py`)
+**ハイブリッドデータベース初期化** (`src/create_hybrid.py`)
 - `docs/md_rag_fts/`からYAMLフロントマター付きMarkdownファイルを解析
 - `---`セパレータでドキュメントをチャンク分割
 - `[FTS]...[/FTS]`タグからFTS用キーワードを抽出
 - 各チャンクに対して2048次元の埋め込みベクトルを生成
 - テーブルが存在しなければ新規作成、存在すれば追加モード
-- FTSインデックスは自動作成される
-- **重要**: HNSWインデックスは自動作成されない - 別途作成が必要
-
-**ハイブリッド検索データベース初期化** (`src/create_hybrid.py`)
-- `create_vss.py`の拡張版
-- ハイブリッド検索（VSS+FTS）用のデータベース作成
+- **FTSインデックスとHNSWインデックスを両方自動作成**
+- 永続化フラグ`hnsw_enable_experimental_persistence`を使用してHNSWインデックスを永続化
 
 **ハイブリッド検索インターフェース** (`src/search_hybrid.py`)
-- `search_vss.py`の拡張版
-- VSS検索とFTS検索を組み合わせたハイブリッド検索機能
-
-**インデックス管理** (`src/index_manager.py`)
-- ベクトル検索用のHNSWインデックスを管理
-- CLIツール、コマンド: create, drop, info, ensure
-- 実験的な永続化機能は`hnsw_enable_experimental_persistence`で有効化
-- Web API起動時は`ensure_index()`でインデックスの存在を保証
-
-**検索インターフェース** (`src/search_vss.py`)
 - `get_connection()`による読み取り専用接続プーリング（VSS/FTS両拡張をロード）
 - `vss_search()`: コサイン距離メトリックでHNSWインデックスを使用したベクトル検索
 - `fts_search()`: BM25スコアリングによる全文検索
 - `search_vss_display()`: VSS検索結果を表示
 - `search_fts_display()`: FTS検索結果を表示
 - デフォルトデータベース: `docs/db/duckdb_search.duckdb`
+- VSS検索とFTS検索の処理時間を詳細に計測
 
 **対話型検索** (`src/search_interactive.py`)
 - 起動時にモデルを1回だけロード（サービス起動に相当）
+- 対話モードで検索タイプを選択（1: VSS / 2: FTS）
 - 以降の検索は高速実行（埋め込み生成とDB検索のみ）
-- ユーザーフレンドリーな結果表示
+- ユーザーフレンドリーな結果表示（絵文字による視覚的フィードバック）
 - 検索統計情報の表示（処理時間、検索回数など）
 - `exit`/`quit`コマンドで終了
 
@@ -70,27 +60,21 @@ uv sync
 ### データベース操作
 
 ```bash
-# Markdownファイルから埋め込みベクトル付きデータベースを作成
-uv run src/create_vss.py
-
-# HNSWインデックスの作成（データベース作成後に必須）
-uv run src/index_manager.py --db docs/db/duckdb_search.duckdb ensure
-
-# インデックス管理
-uv run src/index_manager.py --db <パス> create [--force]
-uv run src/index_manager.py --db <パス> info --index documents_vss_idx
-uv run src/index_manager.py --db <パス> drop --index documents_vss_idx
+# Markdownファイルからハイブリッド検索用データベースを作成
+# （FTSインデックスとHNSWインデックスを両方自動作成）
+uv run src/create_hybrid.py
 ```
 
 ### 検索の実行
 
 ```bash
-# 対話型ベクトル検索（推奨）
+# 対話型ハイブリッド検索（推奨）
+# VSS（ベクトル検索）またはFTS（全文検索）を対話的に選択可能
 uv run src/search_interactive.py
 
-# バッチ処理用のベクトル検索
-uv run src/search_vss.py
-# ※ クエリを変更する場合はmain()内を編集するか、search()関数をインポート
+# バッチ処理用のハイブリッド検索デモ
+uv run src/search_hybrid.py
+# ※ クエリを変更する場合はmain()内を編集
 ```
 
 ## データベーススキーマ
@@ -135,15 +119,14 @@ tag: "タグ"
 ```
 
 ### インデックス管理ワークフロー
-1. `create_vss.py`を実行してデータベースを作成（FTSインデックスは自動作成）
-2. `index_manager.py ensure`を実行してHNSWインデックスを作成
-3. Web API用途では、起動時に`IndexManager.ensure_index()`を呼び出す
+1. `create_hybrid.py`を実行してデータベースを作成
+2. FTSインデックスとHNSWインデックスの両方が自動的に作成される
+3. 永続化フラグ`hnsw_enable_experimental_persistence`により、HNSWインデックスがデータベースファイルに永続化される
 
 ### 接続の取り扱い
-- `create_vss.py`: 書き込み操作、完了後に接続をクローズ
-- `search_vss.py`: 読み取り専用の接続プーリング、シャットダウン時に`close_connection()`を呼び出す
+- `create_hybrid.py`: 書き込み操作、FTS/HNSWインデックス作成、完了後に接続をクローズ
+- `search_hybrid.py`: 読み取り専用の接続プーリング、シャットダウン時に`close_connection()`を呼び出す
 - `search_interactive.py`: 読み取り専用の接続プーリング、対話セッション中は接続を再利用、終了時に`close_connection()`を呼び出す
-- `index_manager.py`: 操作ごとに短命な接続を使用
 
 ### パフォーマンス最適化
 - **モデルロード**: 全スクリプトで`get_model_and_tokenizer()`による遅延初期化とキャッシュを使用

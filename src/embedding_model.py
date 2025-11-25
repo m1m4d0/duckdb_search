@@ -30,6 +30,7 @@ def get_model_and_tokenizer():
             _tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             _model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
 
-        _model = _model.to(device)
+        # 推論専用なのでevalモードにして再現性と速度を担保する
+        _model = _model.to(device).eval()
 
     return _model, _tokenizer
