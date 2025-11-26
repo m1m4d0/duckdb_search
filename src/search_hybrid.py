@@ -3,6 +3,7 @@ import torch
 import time
 
 from embedding_model import get_model_and_tokenizer
+from sentence_transformers import CrossEncoder
 
 # 設定
 DB_NAME = "duckdb_search"
@@ -11,9 +12,20 @@ DB_NAME = "duckdb_search"
 print("=" * 80)
 print("モデル読み込み開始...")
 start_time = time.perf_counter()
+
+# 埋め込みモデル
 v_model, v_tokenizer = get_model_and_tokenizer()
+
+# Rerankingモデル
+device = "cuda" if torch.cuda.is_available() else "cpu"
+r_model = CrossEncoder(
+    "hotchpotch/japanese-bge-reranker-v2-m3-v1", max_length=512, device=device
+)
+
 model_load_time = time.perf_counter() - start_time
 print(f"✓ モデル読み込み完了: {model_load_time:.3f}秒")
+print("  - 埋め込みモデル: pfnet/plamo-embedding-1b")
+print("  - Rerankingモデル: hotchpotch/japanese-bge-reranker-v2-m3-v1")
 print("=" * 80)
 
 # 接続プール（再利用可能な接続）
@@ -186,6 +198,100 @@ def search_fts_display(keywords, limit=3):
     return rows
 
 
+def reranking(query, vss_rows, fts_rows):
+    """
+    VSSとFTSの検索結果をCrossEncoderで再スコアリング
+
+    Args:
+        query: 検索クエリ
+        vss_rows: VSS検索結果（id, distance, document_name, document_path, category, tag, content）
+        fts_rows: FTS検索結果（id, document_name, document_path, category, tag, content, content_fts, score）
+
+    Returns:
+        Reranking結果のリスト（id, rerank_score, document_name, document_path, category, tag, content）
+    """
+    total_start = time.perf_counter()
+
+    # 結果をマージ（重複排除） - idをキーにすることで衝突を防ぐ
+    passages = {}  # {id: (document_name, document_path, category, tag, content)}
+
+    # VSSの結果を追加
+    for row in vss_rows:
+        id, _distance, document_name, _document_path, category, _tag, content = row
+        passages[id] = (document_name, _document_path, category, _tag, content)
+
+    # FTSの結果を追加（同じIDがあれば上書き）
+    for row in fts_rows:
+        id, document_name, _document_path, category, _tag, content, _content_fts, _score = row
+        passages[id] = (document_name, _document_path, category, _tag, content)
+
+    # CrossEncoderで再スコアリング
+    rerank_start = time.perf_counter()
+    scores = r_model.predict([(query, passages[id][4]) for id in passages.keys()])
+    rerank_time = time.perf_counter() - rerank_start
+    print(f"  [Reranking] {rerank_time:.3f}秒")
+
+    # スコア順にソート
+    reranked = sorted(
+        [
+            (id, score, passages[id][0], passages[id][1], passages[id][2], passages[id][3], passages[id][4])
+            for id, score in zip(passages.keys(), scores)
+        ],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    total_time = time.perf_counter() - total_start
+    print(f"  [合計] {total_time:.3f}秒")
+
+    return reranked
+
+
+def hybrid_search_display(query, keywords, limit=3):
+    """
+    ハイブリッド検索（VSS + FTS + Reranking）を実行して結果を表示
+
+    Args:
+        query: VSS検索用のクエリ
+        keywords: FTS検索用のキーワード
+        limit: 各検索で取得する結果数（rerankingで統合される）
+    """
+    print(f"Query: {query}")
+    print(f"Keywords: {keywords}")
+    print("=" * 80)
+
+    # VSS検索
+    print("\n【1. VSS検索実行】")
+    print("-" * 80)
+    vss_rows = vss_search(query, limit=limit)
+
+    # FTS検索
+    print("\n【2. FTS検索実行】")
+    print("-" * 80)
+    fts_rows = fts_search(keywords, limit=limit)
+
+    # Reranking
+    print("\n【3. Reranking実行】")
+    print("-" * 80)
+    reranked = reranking(query, vss_rows, fts_rows)
+
+    # 結果表示
+    print("\n【ハイブリッド検索結果（Reranking後）上位{0}件】".format(min(limit, len(reranked))))
+    print("=" * 80)
+    for idx, (id, score, document_name, document_path, category, tag, content) in enumerate(reranked[:limit], 1):
+        print(f"\n[{idx}] ID: {id}, Rerank Score: {score:.4f}")
+        print(f"  Document: {document_name}")
+        print(f"  Category: {category}")
+        print(f"  Tag: {tag}")
+        print(
+            f"  Content: {content[:100]}..."
+            if len(content) > 100
+            else f"  Content: {content}"
+        )
+
+    return reranked
+
+
 def close_connection():
     """接続を明示的にクローズ（終了時に使用）"""
     global _conn
@@ -205,6 +311,10 @@ def main():
     print("\n" + "=" * 80)
     print("\n【FTS検索】")
     search_fts_display(keywords)
+
+    print("\n" + "=" * 80)
+    print("\n【ハイブリッド検索（VSS + FTS + Reranking）】")
+    hybrid_search_display(query, keywords)
 
     # プログラム終了時
     close_connection()

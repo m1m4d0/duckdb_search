@@ -10,6 +10,7 @@ import torch
 import time
 
 from embedding_model import get_model_and_tokenizer
+from sentence_transformers import CrossEncoder
 
 # 設定
 DB_NAME = "duckdb_search"
@@ -22,9 +23,20 @@ print("=" * 80)
 print("\n🔄 モデル読み込み中...")
 print("  ※ この処理は起動時の1回のみです（サービス起動に相当）")
 start_time = time.perf_counter()
+
+# 埋め込みモデル
 v_model, v_tokenizer = get_model_and_tokenizer()
+
+# Rerankingモデル
+device = "cuda" if torch.cuda.is_available() else "cpu"
+r_model = CrossEncoder(
+    "hotchpotch/japanese-bge-reranker-v2-m3-v1", max_length=512, device=device
+)
+
 model_load_time = time.perf_counter() - start_time
 print(f"✅ モデル読み込み完了: {model_load_time:.3f}秒")
+print("  - 埋め込みモデル: pfnet/plamo-embedding-1b")
+print("  - Rerankingモデル: hotchpotch/japanese-bge-reranker-v2-m3-v1")
 print("\n" + "=" * 80)
 print("準備完了！検索モードを選択してクエリを入力してください")
 print("（'exit' または 'quit' で終了）")
@@ -206,6 +218,80 @@ def display_fts_results(keywords, rows, timings):
         print(f"    💬 {content_preview}")
 
 
+def reranking(query, vss_rows, fts_rows):
+    """
+    VSSとFTSの検索結果をCrossEncoderで再スコアリング
+
+    Args:
+        query: 検索クエリ
+        vss_rows: VSS検索結果
+        fts_rows: FTS検索結果
+
+    Returns:
+        (reranked_rows, timings)
+    """
+    total_start = time.perf_counter()
+
+    # 結果をマージ（重複排除） - idをキーにすることで衝突を防ぐ
+    passages = {}  # {id: (document_name, document_path, category, tag, content)}
+
+    # VSSの結果を追加
+    for row in vss_rows:
+        id, _distance, document_name, _document_path, category, _tag, content = row
+        passages[id] = (document_name, _document_path, category, _tag, content)
+
+    # FTSの結果を追加（同じIDがあれば上書き）
+    for row in fts_rows:
+        id, document_name, _document_path, category, _tag, content, _content_fts, _score = row
+        passages[id] = (document_name, _document_path, category, _tag, content)
+
+    # CrossEncoderで再スコアリング
+    rerank_start = time.perf_counter()
+    scores = r_model.predict([(query, passages[id][4]) for id in passages.keys()])
+    rerank_time = time.perf_counter() - rerank_start
+
+    # スコア順にソート
+    reranked = sorted(
+        [
+            (id, score, passages[id][0], passages[id][1], passages[id][2], passages[id][3], passages[id][4])
+            for id, score in zip(passages.keys(), scores)
+        ],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    total_time = time.perf_counter() - total_start
+
+    return reranked, {
+        "rerank_time": rerank_time,
+        "total_time": total_time,
+    }
+
+
+def display_hybrid_results(query, rows, timings):
+    """ハイブリッド検索結果を表示"""
+    print(f"\n🔍 ハイブリッド検索（VSS + FTS + Reranking）: '{query}'")
+    print(
+        f"⏱️  処理時間: {timings['total_time']:.3f}秒 "
+        f"(Reranking: {timings['rerank_time']:.3f}秒)"
+    )
+    print("-" * 80)
+
+    if not rows:
+        print("❌ 結果が見つかりませんでした")
+        return
+
+    for idx, (id, score, document_name, document_path, category, tag, content) in enumerate(rows, 1):
+        print(f"\n[{idx}] ID: {id} | Rerankスコア: {score:.4f}")
+        print(f"    📄 {document_name} ({category})")
+
+        # 内容を適切な長さで表示
+        content_preview = content[:150].replace("\n", " ")
+        if len(content) > 150:
+            content_preview += "..."
+        print(f"    💬 {content_preview}")
+
+
 def close_connection():
     """接続を明示的にクローズ"""
     global _conn
@@ -224,8 +310,9 @@ def main():
             print("\n検索モードを選択してください:")
             print("  1: VSS（ベクトル類似度検索）")
             print("  2: FTS（全文検索/BM25）")
+            print("  3: ハイブリッド（VSS + FTS + Reranking）")
             try:
-                mode = input("モード (1/2)> ").strip()
+                mode = input("モード (1/2/3)> ").strip()
             except EOFError:
                 print("\n👋 終了します")
                 break
@@ -234,16 +321,18 @@ def main():
                 print("\n👋 終了します")
                 break
 
-            if mode not in ["1", "2"]:
-                print("⚠️  1 または 2 を入力してください")
+            if mode not in ["1", "2", "3"]:
+                print("⚠️  1, 2 または 3 を入力してください")
                 continue
 
             # クエリ入力
             try:
                 if mode == "1":
                     query = input("検索クエリ> ").strip()
-                else:
+                elif mode == "2":
                     query = input("検索キーワード（スペース区切り）> ").strip()
+                else:  # mode == "3"
+                    query = input("検索クエリ> ").strip()
             except EOFError:
                 print("\n👋 終了します")
                 break
@@ -261,9 +350,21 @@ def main():
                 if mode == "1":
                     rows, timings = vss_search(query, limit=5)
                     display_vss_results(query, rows, timings)
-                else:
+                elif mode == "2":
                     rows, timings = fts_search(query, limit=5)
                     display_fts_results(query, rows, timings)
+                else:  # mode == "3"
+                    # ハイブリッド検索: VSS + FTS + Reranking
+                    vss_rows, vss_timings = vss_search(query, limit=5)
+                    fts_rows, fts_timings = fts_search(query, limit=5)
+                    reranked, rerank_timings = reranking(query, vss_rows, fts_rows)
+
+                    # タイミング情報を統合
+                    combined_timings = {
+                        "total_time": vss_timings["total_time"] + fts_timings["total_time"] + rerank_timings["total_time"],
+                        "rerank_time": rerank_timings["rerank_time"],
+                    }
+                    display_hybrid_results(query, reranked[:5], combined_timings)
             except Exception as e:
                 print(f"\n❌ エラーが発生しました: {e}")
                 continue

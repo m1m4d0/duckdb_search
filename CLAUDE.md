@@ -10,6 +10,7 @@ DuckDBを使用したハイブリッド検索システム（プロジェクト�
 - PLaMo埋め込みモデル (pfnet/plamo-embedding-1b) による高品質な日本語セマンティック検索
 - DuckDBのVSS拡張とHNSWインデックスによる高速なベクトル類似度検索
 - DuckDBのFTS拡張とBM25による全文検索
+- CrossEncoder (hotchpotch/japanese-bge-reranker-v2-m3-v1) によるReranking
 - PyTorchによるモデル推論とGPUアクセラレーション
 
 ## アーキテクチャ
@@ -35,15 +36,18 @@ DuckDBを使用したハイブリッド検索システム（プロジェクト�
 - `get_connection()`による読み取り専用接続プーリング（VSS/FTS両拡張をロード）
 - `vss_search()`: コサイン距離メトリックでHNSWインデックスを使用したベクトル検索
 - `fts_search()`: BM25スコアリングによる全文検索
+- `reranking()`: VSSとFTSの結果をCrossEncoderで再スコアリング
 - `search_vss_display()`: VSS検索結果を表示
 - `search_fts_display()`: FTS検索結果を表示
+- `hybrid_search_display()`: ハイブリッド検索（VSS + FTS + Reranking）結果を表示
 - デフォルトデータベース: `docs/db/duckdb_search.duckdb`
-- VSS検索とFTS検索の処理時間を詳細に計測
+- VSS検索、FTS検索、Reranking処理の処理時間を詳細に計測
 
 **対話型検索** (`src/search_interactive.py`)
-- 起動時にモデルを1回だけロード（サービス起動に相当）
-- 対話モードで検索タイプを選択（1: VSS / 2: FTS）
-- 以降の検索は高速実行（埋め込み生成とDB検索のみ）
+- 起動時にモデルを1回だけロード（埋め込みモデル + Rerankingモデル）
+- 対話モードで検索タイプを選択（1: VSS / 2: FTS / 3: ハイブリッド）
+- VSS/FTSモードは埋め込み生成とDB検索のみで高速実行
+- ハイブリッドモードでは、VSSとFTSの結果を統合してCrossEncoderで再スコアリング（Reranking推論も含む）
 - ユーザーフレンドリーな結果表示（絵文字による視覚的フィードバック）
 - 検索統計情報の表示（処理時間、検索回数など）
 - `exit`/`quit`コマンドで終了
@@ -69,10 +73,11 @@ uv run src/create_hybrid.py
 
 ```bash
 # 対話型ハイブリッド検索（推奨）
-# VSS（ベクトル検索）またはFTS（全文検索）を対話的に選択可能
+# VSS（ベクトル検索）、FTS（全文検索）、ハイブリッド（VSS + FTS + Reranking）を対話的に選択可能
 uv run src/search_interactive.py
 
 # バッチ処理用のハイブリッド検索デモ
+# VSS、FTS、ハイブリッド（VSS + FTS + Reranking）の全てを実行
 uv run src/search_hybrid.py
 # ※ クエリを変更する場合はmain()内を編集
 ```
@@ -97,7 +102,7 @@ uv run src/search_hybrid.py
 ## 重要な実装詳細
 
 ### モデル読み込みパターン
-全モジュールは`get_model_and_tokenizer()`による遅延初期化を使用。モデルはグローバルにキャッシュされ、重複ロードを防ぐ。
+全モジュールは`get_model_and_tokenizer()`による遅延初期化を使用。埋め込みモデルはグローバルにキャッシュされ、重複ロードを防ぐ。Rerankingモデル（CrossEncoder）は各スクリプトで個別にロードされ、GPU利用可能時は自動的にGPUで実行される。
 
 ### ドキュメントのチャンク分割
 `docs/md_rag_fts/`内のMarkdownファイルは以下の形式を使用:
@@ -133,3 +138,4 @@ tag: "タグ"
 - **HNSWインデックス**: 線形スキャンではなくHNSWインデックスにより高速な近似最近傍探索を実現
 - **接続プーリング**: 検索スクリプトは読み取り専用接続を再利用し、接続のオーバーヘッドを削減
 - **バッチ処理**: 複数ドキュメントの処理時は`torch.inference_mode()`で推論を最適化
+- **Reranking最適化**: CrossEncoderはGPU利用可能時に自動的にGPUで実行され、バッチ処理により効率的に再スコアリング
